@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lf-usb-bridge"
+version = "1.0.0"
+description = "Standalone bidirectional USB MIDI bridge for Liquid Foot+ controllers"
+requires-python = ">=3.11"
+dependencies = [
+    "mido>=1.3",
+    "python-rtmidi>=1.5",
+    "pyserial>=3.5",
+    "PySide6>=6.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+packaging = [
+    "pyinstaller>=6",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = ["lf_usb_bridge*"]
+exclude = ["assets*", "tests*", "scripts*"]
