@@ -260,3 +260,14 @@ Validated:
 LF+ USB Bridge is released under the [MIT License](LICENSE).
 
 See [Third-Party Notices](THIRD_PARTY_NOTICES.md) for licenses and attribution relating to bundled or required third-party software.
+
+
+## Support
+
+LF+ USB Bridge is free and open source.
+
+If it has been useful to you and you'd like to support future development, you can buy me a coffee:
+
+☕ https://buymeacoffee.com/vaultnaemsae
+
+Thank you for your support!
