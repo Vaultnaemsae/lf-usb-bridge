@@ -3,22 +3,13 @@
 set -euo pipefail
 
 APP_NAME="LF+ USB Bridge"
-BUNDLE_ID="com.vaultnaemsae.lfusbbridge"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ICON_PATH="$ROOT_DIR/assets/app-icon/LF_USB_Bridge.icns"
 ENTRY_POINT="$ROOT_DIR/app.py"
 DIST_DIR="$ROOT_DIR/dist"
-BUILD_DIR="$ROOT_DIR/build"
-SPEC_FILE="$ROOT_DIR/build/pyinstaller/$APP_NAME.spec"
+BUILD_DIR="$ROOT_DIR/build/macos"
+SPEC_FILE="$ROOT_DIR/scripts/lf_usb_bridge_macos.spec"
 APP_PATH="$DIST_DIR/$APP_NAME.app"
-
-CODESIGN_ARGS=()
-
-if [[ -n "${DEVELOPER_ID_APPLICATION:-}" ]]; then
-    CODESIGN_ARGS=(
-        --codesign-identity "$DEVELOPER_ID_APPLICATION"
-    )
-fi
 
 cd "$ROOT_DIR"
 
@@ -36,22 +27,15 @@ echo "Running tests..."
 .venv/bin/python -m pytest
 
 echo "Cleaning previous build..."
-rm -rf "$BUILD_DIR" "$DIST_DIR" "$SPEC_FILE"
+rm -rf "$BUILD_DIR" "$APP_PATH" "$DIST_DIR/$APP_NAME"
 
 echo "Building $APP_NAME..."
 .venv/bin/python -m PyInstaller \
     --noconfirm \
     --clean \
-    --windowed \
-    --name "LF+ USB Bridge" \
-    --specpath "$ROOT_DIR/build/pyinstaller" \
-    --osx-bundle-identifier "$BUNDLE_ID" \
-    --icon "$ICON_PATH" \
-    --hidden-import "mido.backends.rtmidi" \
-    --collect-all "rtmidi" \
-    --hidden-import "serial.tools.list_ports" \
-    ${CODESIGN_ARGS[@]+"${CODESIGN_ARGS[@]}"} \
-    "$ENTRY_POINT"
+    --workpath "$BUILD_DIR" \
+    --distpath "$DIST_DIR" \
+    "$SPEC_FILE"
 
 echo
 echo "Build complete:"

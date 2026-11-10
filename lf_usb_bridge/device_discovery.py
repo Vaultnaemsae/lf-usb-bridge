@@ -11,7 +11,11 @@ from typing import Iterable
 from serial.tools import list_ports
 
 FTDI_VENDOR_ID = 0x0403
+FAMC_LF_PRODUCT_ID = 0x87C0
 REWRITTEN_FTDI_PRODUCT_ID = 0x6015
+# Archived FAMC INFs identify these as LR, X Series, or unspecified FAMC
+# devices, rather than LF+ controllers. Do not infer protocol compatibility.
+OTHER_FAMC_PRODUCT_IDS = frozenset(range(0x87C1, 0x87C7))
 
 
 class DeviceDiscoveryError(RuntimeError):
@@ -43,7 +47,6 @@ _LF_METADATA_KEYWORDS = (
     "liquidfoot",
     "lf+",
     "lf plus",
-    "famc",
 )
 _USBSERIAL_IDENTITY = re.compile(r"usbserial[-_.]?([^/]+)$", re.IGNORECASE)
 
@@ -143,10 +146,26 @@ def is_compatible_device(device: SerialDevice) -> bool:
     so FTDI identity alone is deliberately insufficient for auto-selection.
     """
 
-    return has_lf_identity(device) and (
-        is_rewritten_ftdi_device(device)
-        or is_ftdi_device(device)
-    )
+    return automatic_selection_issue(device) is None
+
+
+def automatic_selection_issue(device: SerialDevice) -> str | None:
+    """Explain exclusion from automatic selection; None identifies an LF+.
+
+    0403:87C0 is the LF+ Series identity in FAMC's original Windows INFs.
+    0403:6015 is shared FTDI hardware, so it still needs LF-specific metadata.
+    """
+
+    if device.vid == FTDI_VENDOR_ID:
+        if device.pid == FAMC_LF_PRODUCT_ID:
+            return None
+        if device.pid in OTHER_FAMC_PRODUCT_IDS:
+            return "This FAMC product ID is not verified as an LF+ controller."
+    if not is_ftdi_device(device):
+        return "Port metadata does not identify an FTDI adapter."
+    if not has_lf_identity(device):
+        return "No Liquid Foot name or LF-prefixed serial number was reported."
+    return None
 
 
 def _normalised_alias(port: str) -> str:
@@ -293,5 +312,5 @@ def discover_device(
 
     raise DeviceDiscoveryError(
         "no compatible Liquid Foot+ USB serial device found; "
-        "connect the rewritten FTDI device or pass --serial-port explicitly"
+        "check that a serial port is available or pass --serial-port explicitly"
     )

@@ -5,6 +5,8 @@ import time
 
 from collections.abc import Callable
 
+import pytest
+
 from lf_usb_bridge.bridge import BridgeStartError
 from PySide6.QtCore import (
     QObject,
@@ -15,7 +17,7 @@ from PySide6.QtCore import (
 )
 
 from lf_usb_bridge.device_discovery import SerialDevice
-from lf_usb_bridge.gui import BridgeSession, ConnectionState, MainWindow
+from lf_usb_bridge.gui import BridgeSession, ConnectionState, MainWindow, MenuBarController
 from lf_usb_bridge.gui_worker import BridgeWorker
 from lf_usb_bridge.midi_ports import (
     DEFAULT_VIRTUAL_INPUT_NAME,
@@ -352,3 +354,51 @@ def test_close_while_connected_waits_for_real_thread_teardown(qapp):
 
     assert session.references_at_thread_finished == [(True, True)]
     assert len(harness.worker_destroy_thread_ids) == 1
+
+
+@pytest.mark.parametrize("platform_name", ["darwin", "win32"])
+def test_hidden_window_keeps_worker_polling_until_explicit_quit(qapp, monkeypatch, platform_name):
+    monkeypatch.setattr("lf_usb_bridge.gui.sys.platform", platform_name)
+    device = SerialDevice(
+        port="TEST-LF",
+        description="Test LF+",
+        manufacturer="FTDI",
+        product="Liquid Foot+ Series",
+        serial_number="TEST123",
+        vid=0x0403,
+        pid=0x6015,
+    )
+    harness = WorkerHarness()
+    session = TrackingBridgeSession(worker_factory=harness.worker_factory)
+    window = MainWindow(discover=lambda: [device], session=session)
+    controller = MenuBarController(qapp, window)
+    window.menu_bar_resident = True
+    quit_states = []
+    monkeypatch.setattr(qapp, "quit", lambda: quit_states.append(session.is_active))
+    try:
+        controller.show_controls()
+        window.start_bridge()
+        wait_until(qapp, lambda: session.state is ConnectionState.CONNECTED)
+        window.close()
+        assert not window.isVisible()
+        polls_when_hidden = harness.poll_count
+        wait_until(qapp, lambda: harness.poll_count >= polls_when_hidden + 5)
+        assert harness.events == ["midi.open", "bridge.start"]
+
+        controller.show_action.trigger()
+        assert window.isVisible()
+        assert len(harness.transports) == 1
+        controller.quit_action.trigger()
+        assert quit_states == [False]
+        assert harness.events == [
+            "midi.open", "bridge.start", "bridge.stop", "midi.close", "transport.close",
+        ]
+        assert len(harness.worker_destroy_thread_ids) == 1
+    finally:
+        session.shutdown()
+        qapp.removeEventFilter(controller)
+        qapp.aboutToQuit.disconnect(controller.tray.hide)
+        window.menu_bar_resident = False
+        window.close()
+        window.deleteLater()
+        qapp.processEvents()

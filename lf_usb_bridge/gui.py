@@ -1,4 +1,4 @@
-"""PySide6 macOS application shell for the LF+ USB Bridge."""
+"""PySide6 desktop application shell for the LF+ USB Bridge."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from PySide6.QtCore import (
     QEasingCurve,
     QObject,
     QPropertyAnimation,
+    QPointF,
     QSettings,
     QThread,
     QTimer,
@@ -24,7 +25,10 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QCloseEvent, QColor, QFont, QIcon, QPalette
+from PySide6.QtGui import (
+    QAction, QCloseEvent, QColor, QFont, QIcon, QKeySequence,
+    QPainter, QPalette, QPen, QPixmap,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -38,16 +42,21 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMenu,
     QPushButton,
     QSizePolicy,
     QStyle,
     QStyleOptionComboBox,
     QStylePainter,
+    QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
 )
 
-from .device_discovery import SerialDevice, compatible_devices
+from .device_discovery import (
+    SerialDevice, enumerate_devices, is_compatible_device, rank_devices,
+)
+from .serial_devices_dialog import SerialDevicesDialog
 from .gui_worker import BridgeWorker, concise_error_message
 from .midi_ports import (
     MACOS_VIRTUAL_PORT_NAME,
@@ -298,6 +307,8 @@ class BridgeSession(QObject):
 class SetupDialog(QDialog):
     """Show the two prerequisites for using the standalone bridge."""
 
+    SERIAL_PORTS_REQUESTED = 2
+
     def __init__(
         self,
         *,
@@ -334,14 +345,15 @@ class SetupDialog(QDialog):
             status_colour = "#FF6961"
             detail_rows = ()
             guidance_text = (
-                "No compatible LF+ serial device was found. LF+ USB Bridge "
-                "does not modify the FTDI EEPROM; use Device Connection Setup "
-                "in Sung Le’s editor to enable USB serial mode."
+                "No compatible LF+ serial device was found. Choose Serial ports… "
+                "to inspect visible ports or select your controller manually. "
+                "If no port is available, check the USB connection and driver. "
+                "Sung Le’s Device Connection Setup can enable USB serial mode."
             )
         else:
             serial_number = (device.serial_number or "Unknown").strip()
             pid_text = f"0x{device.pid:04X}" if device.pid is not None else "Unknown"
-            status_text = "Ready"
+            status_text = "Ready" if is_compatible_device(device) else "Manually selected"
             status_colour = "#20C66B"
             detail_rows = (
                 ("Serial", serial_number),
@@ -349,7 +361,9 @@ class SetupDialog(QDialog):
                 ("USB product ID", pid_text),
             )
             guidance_text = (
-                "LF+ USB Bridge requires the FAMC Liquid Foot+'s FTDI chip to be modified using Sung Le's Device Connection Setup Tool. The process is safe and reversible."
+                "An LF+ serial port can use the original FAMC driver or the "
+                "EEPROM preparation in Sung Le’s Device Connection Setup Tool. "
+                "A manually selected port requires you to click Start."
             )
 
         self.device_status_label = QLabel(status_text)
@@ -496,6 +510,11 @@ class SetupDialog(QDialog):
 
         footer = QHBoxLayout()
         footer.setContentsMargins(0, 4, 0, 0)
+        self.serial_ports_button = QPushButton("Serial ports…")
+        self.serial_ports_button.clicked.connect(
+            lambda: self.done(self.SERIAL_PORTS_REQUESTED)
+        )
+        footer.addWidget(self.serial_ports_button)
         footer.addStretch(1)
         close_button = QPushButton("Close")
         close_button.setObjectName("setupCloseButton")
@@ -531,10 +550,12 @@ class SetupDialog(QDialog):
 class MainWindow(QMainWindow):
     """Compact single-window bridge controls and status."""
 
+    controls_changed = Signal()
+
     def __init__(
         self,
         *,
-        discover: Callable[[], list[SerialDevice]] = compatible_devices,
+        discover: Callable[[], list[SerialDevice]] = enumerate_devices,
         session: BridgeSession | None = None,
     ) -> None:
         super().__init__()
@@ -542,7 +563,9 @@ class MainWindow(QMainWindow):
         self._session = session or BridgeSession(parent=self)
         self._state = ConnectionState.DISCONNECTED
         self._devices: list[SerialDevice] = []
+        self._manual_device_port: str | None = None
         self._close_pending = False
+        self.menu_bar_resident = False
         self._settings = QSettings("Vaultnaemsae", APP_NAME)
         self._preferred_device_serial = self._settings.value(
             "preferredDeviceSerial",
@@ -757,7 +780,19 @@ class MainWindow(QMainWindow):
     @Slot()
     def show_setup_dialog(self) -> None:
         dialog = SetupDialog(device=self.selected_device, parent=self)
-        dialog.exec()
+        if dialog.exec() == SetupDialog.SERIAL_PORTS_REQUESTED:
+            self.show_serial_ports_dialog()
+
+    @Slot()
+    def show_serial_ports_dialog(self) -> None:
+        if self._session.is_active or self._close_pending:
+            return
+        dialog = SerialDevicesDialog(scan=self._discover, parent=self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            device = dialog.selected_device
+            if device is not None:
+                self._manual_device_port = device.port
+                self._populate_devices(dialog.devices)
 
     @Slot()
     def refresh_devices(self) -> None:
@@ -766,12 +801,6 @@ class MainWindow(QMainWindow):
         if self._session.is_active:
             return
 
-        previous_port = (
-            self.selected_device.port
-            if self.selected_device is not None
-            else None
-        )
-
         discovery_error: str | None = None
         try:
             devices = list(self._discover())
@@ -779,6 +808,27 @@ class MainWindow(QMainWindow):
             logger.exception("LF+ device discovery failed")
             devices = []
             discovery_error = concise_error_message(exc)
+        self._populate_devices(devices, discovery_error)
+
+    def _populate_devices(
+        self,
+        available: list[SerialDevice],
+        discovery_error: str | None = None,
+    ) -> None:
+        """Apply automatic matching plus the port explicitly chosen this session."""
+
+        previous_port = (
+            self.selected_device.port
+            if self.selected_device is not None
+            else None
+        )
+
+        devices = [
+            device for device in rank_devices(available)
+            if is_compatible_device(device) or device.port == self._manual_device_port
+        ]
+        if not any(device.port == self._manual_device_port for device in devices):
+            self._manual_device_port = None
 
         self._devices = devices
         self.device_selector.blockSignals(True)
@@ -800,12 +850,21 @@ class MainWindow(QMainWindow):
             else:
                 label = serial_number or device.port
 
+            if device.port == self._manual_device_port:
+                label = f"{label} (manual)"
+
             self.device_selector.addItem(label, device)
 
             if preferred_serial and serial_number == preferred_serial:
                 selected_index = index
             elif not preferred_serial and device.port == previous_port:
                 selected_index = index
+
+        if self._manual_device_port is not None:
+            selected_index = next(
+                index for index, device in enumerate(devices)
+                if device.port == self._manual_device_port
+            )
 
         if devices:
             self.device_selector.setCurrentIndex(selected_index)
@@ -860,6 +919,12 @@ class MainWindow(QMainWindow):
             return
 
         if self.selected_device is None:
+            return
+
+        if self._manual_device_port is not None:
+            return
+
+        if not is_compatible_device(self.selected_device):
             return
 
         self.start_bridge()
@@ -928,6 +993,7 @@ class MainWindow(QMainWindow):
         self.status_label.setVisible(
             self._state is ConnectionState.ERROR and bool(message)
         )
+        self.controls_changed.emit()
 
     @Slot()
     def _on_session_finished(self) -> None:
@@ -943,22 +1009,26 @@ class MainWindow(QMainWindow):
         can_start = (
             has_device
             and not active
+            and not self._close_pending
             and self._state
             in (ConnectionState.DISCONNECTED, ConnectionState.ERROR)
         )
         can_stop = (
             active
+            and not self._close_pending
             and self._state
             in (ConnectionState.CONNECTING, ConnectionState.CONNECTED)
         )
 
         self.start_button.setEnabled(can_start)
         self.stop_button.setEnabled(can_stop)
-        self.setup_button.setEnabled(not active)
-        self.refresh_button.setEnabled(not active)
+        self.setup_button.setEnabled(not active and not self._close_pending)
+        self.refresh_button.setEnabled(not active and not self._close_pending)
         self.device_selector.setEnabled(
-            not active and self.device_selector.count() > 1
+            not active and not self._close_pending
+            and self.device_selector.count() > 1
         )
+        self.controls_changed.emit()
 
     def _update_device_presentation(self) -> None:
         count = self.device_selector.count()
@@ -1095,9 +1165,18 @@ class MainWindow(QMainWindow):
     def shutdown_for_quit(self) -> None:
         """Final blocking cleanup boundary for application-level quit."""
 
+        self._close_pending = True
+        self.menu_bar_resident = False
+        self._state_pulse_animation.stop()
+        self._update_controls()
         self._session.shutdown()
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self.menu_bar_resident:
+            self.hide()
+            event.ignore()
+            return
+
         if self._session.is_active:
             self._close_pending = True
             self._session.stop()
@@ -1108,10 +1187,156 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
+def menu_bar_icon(*, template: bool = True) -> QIcon:
+    """Draw a MIDI socket, with a template variant for the macOS menu bar."""
+
+    icon = QIcon()
+    for scale in (1, 2, 3):
+        pixmap = QPixmap(18 * scale, 18 * scale)
+        pixmap.setDevicePixelRatio(scale)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # A filled blue badge keeps the Windows fallback legible on both
+        # light and dark taskbars. macOS recolours the black template itself.
+        if not template:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#0A66C2"))
+            painter.drawEllipse(QPointF(9, 9), 9, 9)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+        colour = Qt.GlobalColor.black if template else Qt.GlobalColor.white
+        painter.setPen(QPen(colour, 1.6))
+        painter.drawEllipse(QPointF(9, 9), 7, 7)
+        painter.drawLine(QPointF(7.5, 14), QPointF(10.5, 14))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(colour)
+        for x, y in ((4.5, 9), (5.8, 5.8), (9, 4.5), (12.2, 5.8), (13.5, 9)):
+            painter.drawEllipse(QPointF(x, y), 1.1, 1.1)
+        painter.end()
+        icon.addPixmap(pixmap)
+    icon.setIsMask(template)
+    return icon
+
+
+class MenuBarController(QObject):
+    """Keep the bridge accessible from the macOS menu bar or Windows tray."""
+
+    def __init__(self, app: QApplication, window: MainWindow) -> None:
+        super().__init__(window)
+        self._app = app
+        self._window = window
+        self._quitting = False
+        self._is_macos = sys.platform == "darwin"
+        self.menu = QMenu(window)
+        self.status_action = self.menu.addAction(APP_NAME)
+        self.status_action.setEnabled(False)
+        self.detail_action = self.menu.addAction("")
+        self.detail_action.setEnabled(False)
+        self.menu.addSeparator()
+        self.show_action = self.menu.addAction("Show Controls…")
+        self.show_action.triggered.connect(self.show_controls)
+        self.start_action = self.menu.addAction("Start")
+        self.start_action.triggered.connect(window.start_bridge)
+        self.stop_action = self.menu.addAction("Stop")
+        self.stop_action.triggered.connect(window.stop_bridge)
+        self.rescan_action = self.menu.addAction("Rescan Devices")
+        self.rescan_action.triggered.connect(window.refresh_devices)
+        self.menu.addSeparator()
+        self.quit_action = QAction(f"Quit {APP_NAME}", self)
+        self.quit_action.setMenuRole(QAction.MenuRole.NoRole)
+        self.quit_action.setShortcut(QKeySequence.StandardKey.Quit)
+        self.quit_action.triggered.connect(self.quit)
+        self.menu.addAction(self.quit_action)
+        window.addAction(self.quit_action)
+
+        icon = menu_bar_icon() if self._is_macos else window.windowIcon()
+        if icon.isNull():
+            icon = menu_bar_icon(template=False)
+        self.tray = QSystemTrayIcon(icon, self)
+        self.tray.setContextMenu(self.menu)
+        self.tray.activated.connect(self._on_tray_activated)
+        self.menu.setDefaultAction(self.show_action)
+        window.controls_changed.connect(self.update_menu)
+        self.menu.aboutToShow.connect(self.update_menu)
+        app.installEventFilter(self)
+        app.aboutToQuit.connect(self.tray.hide)
+        self.update_menu()
+
+    @Slot()
+    def update_menu(self) -> None:
+        window = self._window
+        state = window.connection_state.value
+        message = window.status_label.text()
+        self.status_action.setText(f"{APP_NAME} — {state}")
+        self.detail_action.setText(message)
+        self.detail_action.setVisible(bool(message))
+        self.tray.setToolTip(f"{APP_NAME}: {state}\n{message}")
+        self.start_action.setEnabled(window.start_button.isEnabled())
+        self.stop_action.setEnabled(window.stop_button.isEnabled())
+        self.rescan_action.setEnabled(window.refresh_button.isEnabled())
+
+    @Slot()
+    def show_controls(self) -> None:
+        if self._quitting:
+            return
+        self._window.showNormal()
+        self._window.raise_()
+        self._window.activateWindow()
+
+    @Slot(QSystemTrayIcon.ActivationReason)
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        # macOS opens the native menu on click; Windows opens the controls
+        # on left-click and leaves right-click to the native context menu.
+        if not self._is_macos and reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self.show_controls()
+
+    @Slot()
+    def quit(self) -> None:
+        if self._quitting:
+            return
+        self._quitting = True
+        self.menu.setEnabled(False)
+        # Wait for serial/MIDI/thread cleanup before removing tray access.
+        self._window.shutdown_for_quit()
+        self.tray.hide()
+        self._app.quit()
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if watched is self._app and event.type() == QEvent.Type.Quit:
+            # Also cover application-level termination (e.g. macOS Quit).
+            if not self._quitting:
+                self._quitting = True
+                self._window.shutdown_for_quit()
+        return super().eventFilter(watched, event)
+
+
+def configure_desktop(app: QApplication, window: MainWindow) -> MenuBarController | None:
+    """Keep a menu bar/tray presence, with a window fallback if unavailable."""
+
+    if (
+        (sys.platform == "darwin" or sys.platform.startswith("win"))
+        and QSystemTrayIcon.isSystemTrayAvailable()
+    ):
+        controller = MenuBarController(app, window)
+        app.setQuitOnLastWindowClosed(False)
+        window.menu_bar_resident = True
+        controller.tray.show()
+        if sys.platform.startswith("win"):
+            controller.show_controls()
+        return controller
+
+    app.setQuitOnLastWindowClosed(True)
+    window.show()
+    return None
+
+
 def create_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lf-usb-bridge-gui",
-        description="Launch the LF+ USB Bridge macOS application.",
+        description="Launch the LF+ USB Bridge desktop application.",
     )
     parser.add_argument(
         "--smoke-test",
@@ -1148,7 +1373,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not app_icon.isNull():
         app.setWindowIcon(app_icon)
 
-    discover = (lambda: []) if args.smoke_test else compatible_devices
+    discover = (lambda: []) if args.smoke_test else enumerate_devices
     window = MainWindow(discover=discover)
 
     if not app_icon.isNull():
@@ -1164,7 +1389,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("LF+ USB Bridge GUI smoke test passed")
         return 0
 
-    window.show()
+    menu_bar = configure_desktop(app, window)
     if not owns_application:
         return 0
     return app.exec()

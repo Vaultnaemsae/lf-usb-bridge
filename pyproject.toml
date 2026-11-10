@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lf-usb-bridge"
-version = "1.0.0"
+version = "1.0.1"
 description = "Standalone bidirectional USB MIDI bridge for Liquid Foot+ controllers"
 requires-python = ">=3.11"
 dependencies = [

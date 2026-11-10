@@ -4,6 +4,7 @@ import pytest
 
 from lf_usb_bridge.device_discovery import (
     DeviceDiscoveryError,
+    automatic_selection_issue,
     compatible_devices,
     deduplicate_devices,
     discover_device,
@@ -29,6 +30,52 @@ def test_ftdi_detection():
     )
 
     assert is_ftdi_device(dev)
+
+
+@pytest.mark.parametrize("pid", [0x87C0, 0x6015])
+def test_windows_generic_metadata_requires_lf_evidence_only_for_shared_pid(pid):
+    dev = SerialDevice(
+        "COM7", "USB Serial Port (COM7)", "FTDI", None, None, 0x0403, pid,
+        hwid=f"USB VID:PID=0403:{pid:04X}",
+    )
+    assert is_compatible_device(dev) == (pid == 0x87C0)
+    if pid == 0x87C0:
+        assert discover_device([dev]) == dev
+    else:
+        assert "LF-prefixed" in automatic_selection_issue(dev)
+
+
+def test_lf_product_id_does_not_identify_a_different_vendor():
+    dev = SerialDevice("COM7", "Serial port", None, None, None, 0x1234, 0x87C0)
+    assert not is_compatible_device(dev)
+
+
+@pytest.mark.parametrize("pid", range(0x87C1, 0x87C7))
+def test_other_famc_products_are_excluded_even_with_lf_like_metadata(pid):
+    dev = SerialDevice(
+        "COM7", "FAMC LF+ Series (COM7)", "FAMC", None, "LF123456", 0x0403, pid,
+    )
+    assert not is_compatible_device(dev)
+    assert "not verified" in automatic_selection_issue(dev)
+
+
+def test_famc_manufacturer_alone_does_not_identify_rewritten_lf():
+    dev = SerialDevice("COM7", "USB Serial Port", "FAMC", None, None, 0x0403, 0x6015)
+    assert not has_lf_identity(dev)
+    assert not is_compatible_device(dev)
+
+
+def test_windows_ftdibus_metadata_is_preserved_and_matches_stock_lf(monkeypatch):
+    port = SimpleNamespace(
+        device="COM7", description="USB Serial Port (COM7)", manufacturer="FTDI",
+        product=None, serial_number=None, vid=0x0403, pid=0x87C0,
+        location=None, hwid="USB VID:PID=0403:87C0",
+    )
+    monkeypatch.setattr("serial.tools.list_ports.comports", lambda: [port])
+    dev = discover_device()
+    assert dev.port == "COM7"
+    assert dev.product is None
+    assert dev.hwid == port.hwid
 
 
 def test_non_ftdi():

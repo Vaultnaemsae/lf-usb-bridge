@@ -4,8 +4,10 @@ import sys
 import time
 from contextlib import contextmanager
 
-from PySide6.QtCore import QObject, QPropertyAnimation, Signal, Qt
-from PySide6.QtWidgets import QLabel
+import pytest
+
+from PySide6.QtCore import QEvent, QObject, QPropertyAnimation, Signal, Qt
+from PySide6.QtWidgets import QLabel, QSystemTrayIcon
 
 from lf_usb_bridge.device_discovery import SerialDevice
 from lf_usb_bridge.gui import (
@@ -17,7 +19,9 @@ from lf_usb_bridge.gui import (
     ConnectionState,
     EDITOR_REPOSITORY_URL,
     MainWindow,
+    MenuBarController,
     SetupDialog,
+    configure_desktop,
 )
 from lf_usb_bridge.midi_ports import (
     DEFAULT_VIRTUAL_INPUT_NAME,
@@ -63,6 +67,8 @@ def managed_window(qapp, *args, **kwargs):
             window._session.shutdown()
         window.close()
         qapp.processEvents()
+        window.deleteLater()
+        qapp.sendPostedEvents(window, QEvent.Type.DeferredDelete)
 
 
 class FakeSession(QObject):
@@ -393,6 +399,199 @@ def test_application_quit_boundary_waits_for_session(qapp):
         assert not session.is_active
 
 
+@contextmanager
+def managed_menu_bar(qapp, window):
+    controller = MenuBarController(qapp, window)
+    window.menu_bar_resident = True
+    try:
+        yield controller
+    finally:
+        qapp.removeEventFilter(controller)
+        qapp.aboutToQuit.disconnect(controller.tray.hide)
+        window.controls_changed.disconnect(controller.update_menu)
+        window.menu_bar_resident = False
+        controller.tray.hide()
+        controller.deleteLater()
+        qapp.sendPostedEvents(controller, QEvent.Type.DeferredDelete)
+
+
+def test_menu_bar_controls_work_while_window_stays_hidden(qapp):
+    device = make_device("/dev/cu.usbserial-LF123456", "LF123456")
+    session = FakeSession()
+    with managed_window(qapp, discover=lambda: [device], session=session) as window:
+        with managed_menu_bar(qapp, window) as controller:
+            assert not window.isVisible()
+            assert controller.start_action.isEnabled()
+            assert not controller.stop_action.isEnabled()
+
+            controller.start_action.trigger()
+            assert session.start_ports == [device.port]
+            assert "Connecting" in controller.status_action.text()
+            assert not controller.start_action.isEnabled()
+            assert not controller.rescan_action.isEnabled()
+            assert controller.stop_action.isEnabled()
+
+            session.connect_successfully()
+            assert "Connected" in controller.status_action.text()
+            controller.stop_action.trigger()
+            assert session.stop_count == 1
+            session.finish_cleanly()
+            assert controller.start_action.isEnabled()
+            assert controller.rescan_action.isEnabled()
+            assert not window.isVisible()
+
+
+def test_menu_bar_rescan_and_failure_remain_accessible_without_window(qapp):
+    device = make_device("/dev/cu.usbserial-LF123456", "LF123456")
+    responses = iter(([], [device]))
+    session = FakeSession()
+    with managed_window(qapp, discover=lambda: next(responses), session=session) as window:
+        with managed_menu_bar(qapp, window) as controller:
+            assert not controller.start_action.isEnabled()
+            assert controller.detail_action.text() == NO_DEVICE_MESSAGE
+            controller.rescan_action.trigger()
+            assert controller.start_action.isEnabled()
+            controller.start_action.trigger()
+            session.fail("Serial device is already in use")
+            assert "Error" in controller.status_action.text()
+            assert controller.detail_action.text() == "Serial device is already in use"
+            assert "Serial device is already in use" in controller.tray.toolTip()
+            assert controller.start_action.isEnabled()
+            assert not window.isVisible()
+
+
+@pytest.mark.parametrize("connected", [False, True])
+@pytest.mark.parametrize("platform_name", ["darwin", "win32"])
+def test_close_hides_controls_and_preserves_active_menu_bar_session(
+    qapp, monkeypatch, connected, platform_name,
+):
+    monkeypatch.setattr("lf_usb_bridge.gui.sys.platform", platform_name)
+    device = make_device("/dev/cu.usbserial-LF123456", "LF123456")
+    session = FakeSession()
+    with managed_window(qapp, discover=lambda: [device], session=session) as window:
+        with managed_menu_bar(qapp, window) as controller:
+            controller.show_action.trigger()
+            window.start_bridge()
+            if connected:
+                session.connect_successfully()
+            assert window.isVisible()
+            assert not window.close()
+            assert not window.isVisible()
+            assert session.is_active
+            assert session.stop_count == 0
+            controller.show_action.trigger()
+            assert window.isVisible()
+            assert session.start_ports == [device.port]
+
+
+@pytest.mark.parametrize("connected", [False, True])
+@pytest.mark.parametrize("platform_name", ["darwin", "win32"])
+def test_menu_bar_quit_cleans_session_before_application_exit(
+    qapp, monkeypatch, connected, platform_name,
+):
+    monkeypatch.setattr("lf_usb_bridge.gui.sys.platform", platform_name)
+    device = make_device("/dev/cu.usbserial-LF123456", "LF123456")
+    session = FakeSession()
+    state_at_quit = []
+    monkeypatch.setattr(qapp, "quit", lambda: state_at_quit.append(session.is_active))
+    with managed_window(qapp, discover=lambda: [device], session=session) as window:
+        with managed_menu_bar(qapp, window) as controller:
+            window.start_bridge()
+            if connected:
+                session.connect_successfully()
+            controller.quit_action.trigger()
+            controller.quit()
+            assert state_at_quit == [False]
+            assert session.shutdown_count == 1
+            assert session.stop_count == 1
+            assert not window.menu_bar_resident
+            assert window.close()
+
+
+@pytest.mark.parametrize("platform_name", ["darwin", "win32"])
+def test_application_quit_event_cleans_hidden_menu_bar_session(qapp, monkeypatch, platform_name):
+    monkeypatch.setattr("lf_usb_bridge.gui.sys.platform", platform_name)
+    device = make_device("/dev/cu.usbserial-LF123456", "LF123456")
+    session = FakeSession()
+    with managed_window(qapp, discover=lambda: [device], session=session) as window:
+        with managed_menu_bar(qapp, window) as controller:
+            window.start_bridge()
+            assert not controller.eventFilter(qapp, QEvent(QEvent.Type.Quit))
+            assert not session.is_active
+            assert not window.menu_bar_resident
+            assert session.shutdown_count == 1
+
+
+@pytest.mark.parametrize(
+    "platform_name, tray_available",
+    [("darwin", False), ("win32", False), ("linux", True)],
+)
+def test_desktop_window_fallback(qapp, monkeypatch, platform_name, tray_available):
+    monkeypatch.setattr("lf_usb_bridge.gui.sys.platform", platform_name)
+    monkeypatch.setattr(QSystemTrayIcon, "isSystemTrayAvailable", lambda: tray_available)
+    with managed_window(qapp, discover=lambda: [], session=FakeSession()) as window:
+        try:
+            assert configure_desktop(qapp, window) is None
+            assert window.isVisible()
+            assert not window.menu_bar_resident
+            assert qapp.quitOnLastWindowClosed()
+        finally:
+            qapp.setQuitOnLastWindowClosed(False)
+
+
+@pytest.mark.parametrize("platform_name", ["darwin", "win32"])
+def test_desktop_launches_with_accessible_menu_bar_or_tray(qapp, monkeypatch, platform_name):
+    monkeypatch.setattr("lf_usb_bridge.gui.sys.platform", platform_name)
+    monkeypatch.setattr(QSystemTrayIcon, "isSystemTrayAvailable", lambda: True)
+    with managed_window(qapp, discover=lambda: [], session=FakeSession()) as window:
+        controller = configure_desktop(qapp, window)
+        try:
+            assert controller is not None
+            assert controller.tray.isVisible()
+            assert controller.tray.icon().isMask() == (platform_name == "darwin")
+            assert not controller.tray.icon().isNull()
+            assert window.isVisible() == (platform_name == "win32")
+            assert window.menu_bar_resident
+            assert not qapp.quitOnLastWindowClosed()
+            assert not window.close()
+            assert not window.isVisible()
+            assert controller.tray.isVisible()
+            controller.show_action.trigger()
+            assert window.isVisible()
+        finally:
+            if controller is not None:
+                qapp.removeEventFilter(controller)
+                qapp.aboutToQuit.disconnect(controller.tray.hide)
+                window.controls_changed.disconnect(controller.update_menu)
+                controller.tray.hide()
+                controller.deleteLater()
+                qapp.sendPostedEvents(controller, QEvent.Type.DeferredDelete)
+            window.menu_bar_resident = False
+
+
+@pytest.mark.parametrize("platform_name", ["darwin", "win32"])
+@pytest.mark.parametrize(
+    "reason",
+    [
+        QSystemTrayIcon.ActivationReason.Trigger,
+        QSystemTrayIcon.ActivationReason.DoubleClick,
+        QSystemTrayIcon.ActivationReason.Context,
+    ],
+)
+def test_tray_activation_uses_platform_conventions(qapp, monkeypatch, platform_name, reason):
+    monkeypatch.setattr("lf_usb_bridge.gui.sys.platform", platform_name)
+    with managed_window(qapp, discover=lambda: [], session=FakeSession()) as window:
+        with managed_menu_bar(qapp, window) as controller:
+            controller.tray.activated.emit(reason)
+            should_show = platform_name == "win32" and reason != QSystemTrayIcon.ActivationReason.Context
+            assert window.isVisible() == should_show
+            if should_show:
+                window.showMinimized()
+                controller.tray.activated.emit(reason)
+                assert not window.isMinimized()
+                assert window.isVisible()
+
+
 def test_worker_factory_failure_transitions_session_to_error(qapp):
     created_ports: list[str] = []
 
@@ -572,3 +771,141 @@ def test_setup_dialog_uses_plain_layout_without_clipping_cards(qapp):
     finally:
         dialog.close()
         qapp.processEvents()
+
+
+def test_serial_ports_dialog_reports_exclusions_without_selecting(qapp):
+    from lf_usb_bridge.serial_devices_dialog import SerialDevicesDialog
+
+    shared = SerialDevice("COM7", "USB Serial Port (COM7)", "FTDI", None, None,
+                          0x0403, 0x6015, hwid="USB VID:PID=0403:6015")
+    router = SerialDevice("COM8", "FAMC LR Series", "FAMC", None, None, 0x0403, 0x87C1)
+    dialog = SerialDevicesDialog(scan=lambda: [shared, router])
+    try:
+        assert dialog.port_selector.count() == 2
+        assert dialog.selected_device is None
+        assert not dialog.use_button.isEnabled()
+        dialog.accept()
+        assert dialog.result() == 0
+        details = dialog.details.toPlainText()
+        assert "COM7" in details and "COM8" in details
+        assert "0403:6015" in details
+        assert "LF-prefixed" in details
+        assert "not verified" in details
+        assert "Hardware ID: USB VID:PID=0403:6015" in details
+        dialog.port_selector.setCurrentIndex(0)
+        assert dialog.use_button.isEnabled()
+        dialog.use_button.click()
+        assert dialog.selected_device == shared
+        assert dialog.result() == dialog.DialogCode.Accepted
+    finally:
+        dialog.close()
+
+
+def test_serial_ports_dialog_clears_stale_ports_after_scan_failure(qapp):
+    from lf_usb_bridge.serial_devices_dialog import SerialDevicesDialog
+
+    device = make_device("COM7", "LF123456")
+    responses = iter(([device], RuntimeError("USB enumeration unavailable"), []))
+
+    def scan():
+        response = next(responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    dialog = SerialDevicesDialog(scan=scan)
+    try:
+        dialog.port_selector.setCurrentIndex(0)
+        dialog.rescan_button.click()
+        assert dialog.selected_device is None
+        assert dialog.devices == []
+        assert not dialog.use_button.isEnabled()
+        assert "USB enumeration unavailable" in dialog.details.toPlainText()
+        dialog.rescan_button.click()
+        assert "No serial ports" in dialog.details.toPlainText()
+        assert "COM port" in dialog.details.toPlainText()
+    finally:
+        dialog.close()
+
+
+def test_main_window_recognises_stock_windows_lf_without_text_identity(qapp):
+    device = SerialDevice("COM7", "USB Serial Port", None, None, None, 0x0403, 0x87C0)
+    with managed_window(qapp, discover=lambda: [device], session=FakeSession()) as window:
+        assert window.selected_device == device
+        assert window.start_button.isEnabled()
+
+
+def test_setup_manual_port_selection_requires_start_and_survives_rescan(qapp, monkeypatch):
+    from lf_usb_bridge.serial_devices_dialog import SerialDevicesDialog
+
+    generic = SerialDevice("COM7", "USB Serial Port", "FTDI", None, None, 0x0403, 0x6015)
+    available = [generic]
+    session = FakeSession()
+
+    def choose_port(dialog):
+        assert dialog.selected_device is None
+        dialog.port_selector.setCurrentIndex(0)
+        dialog.use_button.click()
+        return dialog.result()
+
+    monkeypatch.setattr(SetupDialog, "exec", lambda dialog: 2)
+    monkeypatch.setattr(SerialDevicesDialog, "exec", choose_port)
+    with managed_window(qapp, discover=lambda: available, session=session) as window:
+        assert window.selected_device is None
+        window.show_setup_dialog()
+        assert window.selected_device == generic
+        assert "manual" in window.device_selector.currentText()
+        assert session.start_ports == []
+        # Even a queued launch callback must not open this unverified port.
+        window.auto_connect_checkbox.blockSignals(True)
+        window.auto_connect_checkbox.setChecked(True)
+        window.auto_connect_checkbox.blockSignals(False)
+        window._auto_connect_if_possible()
+        qapp.processEvents()
+        assert session.start_ports == []
+        window.refresh_devices()
+        assert window.selected_device == generic
+        window.start_button.click()
+        assert session.start_ports == ["COM7"]
+        session.finish_cleanly()
+        available.clear()
+        window.refresh_devices()
+        assert window.selected_device is None
+        assert not window.start_button.isEnabled()
+        available.append(generic)
+        window.refresh_devices()
+        assert window.selected_device is None
+
+
+def test_cancelling_manual_selection_keeps_automatic_selection(qapp, monkeypatch):
+    from lf_usb_bridge.serial_devices_dialog import SerialDevicesDialog
+
+    known = make_device("COM8", "LF123456")
+    generic = SerialDevice("COM7", "USB Serial Port", "FTDI", None, None, 0x0403, 0x6015)
+
+    def cancel(dialog):
+        dialog.port_selector.setCurrentIndex(1)
+        dialog.reject()
+        return dialog.result()
+
+    monkeypatch.setattr(SerialDevicesDialog, "exec", cancel)
+    with managed_window(qapp, discover=lambda: [generic, known], session=FakeSession()) as window:
+        assert window.device_selector.count() == 1
+        window.show_serial_ports_dialog()
+        assert window.selected_device == known
+        assert window.device_selector.count() == 1
+
+
+def test_serial_ports_cannot_be_changed_during_connection(qapp, monkeypatch):
+    from lf_usb_bridge.serial_devices_dialog import SerialDevicesDialog
+
+    def unexpected_dialog(dialog):
+        raise AssertionError("must not allow port changes while connecting")
+
+    monkeypatch.setattr(SerialDevicesDialog, "exec", unexpected_dialog)
+    session = FakeSession()
+    with managed_window(qapp, discover=lambda: [make_device("COM7", "LF123456")],
+                        session=session) as window:
+        window.start_bridge()
+        window.show_serial_ports_dialog()
+        assert session.start_ports == ["COM7"]
