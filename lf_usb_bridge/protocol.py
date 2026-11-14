@@ -8,6 +8,11 @@ from enum import Enum
 FAMC_MANUFACTURER_ID = bytes((0x00, 0x00, 0x7C))
 LF_DEVICE_ID = bytes((0x0F, 0x0F))
 
+# Helix uses a seven-bit non-commercial SysEx request. The confirmed JR+
+# peer IDs are 124 / 0, so the raw cancel uses sender 1.
+TUNER_CANCEL_REQUEST = bytes.fromhex("f0 7d 4c 46 42 01 01 f7")
+TUNER_PEER_CANCEL = bytes.fromhex("f0 00 00 7c 09 04 01 fa 00 00 00 f7")
+
 
 class BridgeCommand(Enum):
     """Commands used to open and close the LF+ live USB MIDI stream."""

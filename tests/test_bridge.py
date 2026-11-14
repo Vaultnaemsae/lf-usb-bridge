@@ -14,6 +14,8 @@ from lf_usb_bridge.protocol import (
     INITIALISE_FRAME,
     START_STREAM_FRAME,
     STOP_STREAM_FRAME,
+    TUNER_CANCEL_REQUEST,
+    TUNER_PEER_CANCEL,
 )
 
 IDENTIFICATION_REPLY = bytes.fromhex("f0 05 00 7c f7")
@@ -23,6 +25,36 @@ EXPECTED_STARTUP_WRITES = [
     INITIALISE_FRAME,
     START_STREAM_FRAME,
 ]
+
+
+def test_tuner_cancel_translates_only_during_controller_tuner():
+    transport = FakeTransport()
+    received = []
+    controller = BridgeController(transport, received.append)
+    controller.start()
+
+    controller.send_midi(TUNER_CANCEL_REQUEST)
+    assert transport.writes == EXPECTED_STARTUP_WRITES
+    transport.incoming.extend(bytes.fromhex("b0 0f 7f"))
+    controller.poll()
+    controller.send_midi(TUNER_CANCEL_REQUEST)
+    controller.send_midi(TUNER_CANCEL_REQUEST)
+    assert transport.writes == EXPECTED_STARTUP_WRITES + [TUNER_PEER_CANCEL]
+    assert TUNER_PEER_CANCEL == bytes.fromhex("f0 00 00 7c 09 04 01 fa 00 00 00 f7")
+
+    transport.incoming.extend(bytes.fromhex("b0 0f 7f b0 0f 00"))
+    controller.poll()
+    controller.send_midi(TUNER_CANCEL_REQUEST)
+    tempo = bytes.fromhex("f0 00 01 74 07 10 f7")
+    controller.send_midi(tempo)
+    assert transport.writes == EXPECTED_STARTUP_WRITES + [TUNER_PEER_CANCEL, tempo]
+    assert received == [bytes.fromhex(message) for message in ("b0 0f 7f", "b0 0f 7f", "b0 0f 00")]
+
+    transport.incoming.extend(bytes.fromhex("b0 0f 7f"))
+    controller.poll()
+    controller.send_midi(TUNER_CANCEL_REQUEST)
+    assert transport.writes[-1] == TUNER_PEER_CANCEL
+    assert transport.writes.count(TUNER_PEER_CANCEL) == 2
 
 
 class FakeTransport:

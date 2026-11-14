@@ -99,8 +99,8 @@ def test_macos_bundle_is_menu_bar_only_before_signing(monkeypatch):
     assert calls["EXE"]["console"] is False
     assert calls["EXE"]["codesign_identity"] == "test signing identity"
     assert calls["BUNDLE"]["info_plist"]["LSUIElement"] is True
-    assert calls["BUNDLE"]["info_plist"]["CFBundleShortVersionString"] == "1.0.1"
-    assert calls["BUNDLE"]["info_plist"]["CFBundleVersion"] == "1.0.1"
+    assert calls["BUNDLE"]["info_plist"]["CFBundleShortVersionString"] == "1.0.2"
+    assert calls["BUNDLE"]["info_plist"]["CFBundleVersion"] == "1.0.2"
     assert calls["BUNDLE"]["bundle_identifier"] == "com.vaultnaemsae.lfusbbridge"
     assert Path(calls["BUNDLE"]["icon"]).is_file()
     assert "mido.backends.rtmidi" in calls["Analysis"]["hiddenimports"]

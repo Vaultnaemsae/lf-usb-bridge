@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import threading
 import time
 
 from collections.abc import Callable
@@ -14,6 +16,8 @@ from .protocol import (
     HANDSHAKE_FRAME,
     INITIALISE_FRAME,
     START_STREAM_FRAME,
+    TUNER_CANCEL_REQUEST,
+    TUNER_PEER_CANCEL,
     is_identification_reply,
 )
 
@@ -77,6 +81,8 @@ class BridgeController:
         self._parser = parser or RawMidiStreamParser()
         self._read_limit = read_limit
         self._state = BridgeState.STOPPED
+        self._output_lock = threading.Lock()
+        self._tuner_active = False
 
     @property
     def state(self) -> BridgeState:
@@ -97,6 +103,7 @@ class BridgeController:
             )
 
         self._state = BridgeState.STARTING
+        self._tuner_active = False
         self._parser.reset()
 
         try:
@@ -172,20 +179,27 @@ class BridgeController:
         messages = self._parser.feed(chunk)
 
         for message in messages:
+            if len(message) == 3 and message[:2] == b"\xb0\x0f":
+                with self._output_lock:
+                    self._tuner_active = message[2] >= 64
             self._midi_output(message)
 
         return len(messages)
 
     def send_midi(self, message: bytes | bytearray | memoryview) -> None:
         """Forward one computer MIDI message to the LF+ serial stream."""
-        if self._state is not BridgeState.RUNNING:
-            raise BridgeError("bridge is not running")
-
         payload = bytes(message)
-        if not payload:
-            return
-
-        self._transport.write(payload)
+        with self._output_lock:
+            if self._state is not BridgeState.RUNNING:
+                raise BridgeError("bridge is not running")
+            if payload == TUNER_CANCEL_REQUEST:
+                if not self._tuner_active:
+                    return
+                self._tuner_active = False
+                self._transport.write(TUNER_PEER_CANCEL)
+                logging.getLogger(__name__).info("LF+ tuner cancel written")
+            elif payload:
+                self._transport.write(payload)
 
     def stop(self) -> None:
         """Stop the LF+ stream and close the serial connection."""
@@ -195,12 +209,15 @@ class BridgeController:
         if self._state is BridgeState.STOPPING:
             return
 
-        self._state = BridgeState.STOPPING
         stop_error: Exception | None = None
 
         try:
+            with self._output_lock:
+                self._state = BridgeState.STOPPING
+                self._tuner_active = False
+                if self._transport.is_open:
+                    self._transport.write(STOP_STREAM_FRAME)
             if self._transport.is_open:
-                self._transport.write(STOP_STREAM_FRAME)
                 time.sleep(0.2)
         except Exception as exc:
             stop_error = exc
